@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 import requests
 from models import PaymentRequest
 
@@ -252,17 +253,42 @@ Return ONLY this JSON:
     "assessment": "<one sentence, your independent take>"
 }}"""
 
-    try:
-        response = requests.post(
-            f"{api_endpoint}?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
-            },
-            timeout=20,
-        )
+    # Gemini's free/preview tiers return 429/503 under load fairly often — that's
+    # a transient "try again" signal, not a config error, so retry once after a
+    # short backoff before giving up and treating it as genuinely unavailable.
+    # Never raises: any outcome short of a clean 200 falls through to `response
+    # is None` below and is handled the same way as every other failure mode.
+    RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+    response = None
 
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                f"{api_endpoint}?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 600},
+                },
+                timeout=20,
+            )
+            if response.status_code in RETRYABLE_STATUS and attempt == 0:
+                print(f"    Gemini API returned HTTP {response.status_code} (transient), retrying once...")
+                response = None
+                time.sleep(2)
+                continue
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            print(f"    Gemini request {type(e).__name__} on attempt {attempt + 1}: {e}")
+            if attempt == 0:
+                time.sleep(2)
+            continue
+
+    if response is None:
+        print("    Gemini unavailable after retry")
+        return None
+
+    try:
         if response.status_code != 200:
             print(f"    Gemini API returned HTTP {response.status_code}: {response.text[:500]!r}")
             return None
