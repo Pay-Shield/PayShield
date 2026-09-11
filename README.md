@@ -10,14 +10,15 @@ Intelligent payment security assistant that analyzes payment requests through mu
 1. **Recipient Verification** — Is the payee known, new, or flagged?
 2. **Risk Analysis (Rules)** — Amount, keywords, urgency/impersonation language
 3. **Behavioral Pattern** — Velocity checks and user baseline deviation
-4. **LLM Reasoning (Hybrid)** — Nemotron for fast fraud classification; Claude for user-facing explanations (Medium/High risk only)
+4. **LLM Reasoning (Hybrid, two models)** — Nemotron (primary) classifies intent and writes its own explanation on every request; Gemini (secondary, advisory) is consulted only for Medium+/High/Critical risk as an independent cross-check — it never alters the score
 5. **Decision & Policy** — Aggregates all signals → score → category → action
 
 **Key Principle:** Rules + LLM support the decision; deterministic rules engine is the final authority. No LLM-only decisions.
 
 **Model Stack:**
-- **Fraud Classification:** Nemotron 3.5 Lightning (fast, lightweight) — falls back to keyword heuristics if no API key
-- **Explanations:** Claude Sonnet 5 (high-quality, reserved for Medium/High risk) — falls back to templated text if no API key
+- **Primary — Nemotron 3.5 Lightning** (NVIDIA NIM): classifies fraud intent (score adjustment, red flags) AND writes its own narrative explanation, on every request. Falls back to keyword heuristics if no API key or the call fails.
+- **Secondary — Gemini Flash** (Google): consulted only when the running score is already Medium+ (≥30). Purely advisory — an independent "does this look right to a second model too" cross-check appended to the narrative. Never modifies the score. Skipped entirely if no `GEMINI_API_KEY` is set — this is an enhancement, not a dependency.
+- Claude/Anthropic is **not used** in this build.
 - **Rules engine:** always runs, always the final authority
 
 **Categories (internal vocabulary):**
@@ -37,7 +38,7 @@ payshield/
 │   ├── pipeline.py           # Shared 5-module risk pipeline (parallel fan-out + aggregate)
 │   ├── models.py             # Pydantic models (internal PS09 shape + frontend contract shape)
 │   ├── modules.py            # Recipient Verification, Risk Rules, Behavioral Pattern
-│   ├── llm_reasoning.py      # Nemotron fraud classification + Claude explanations
+│   ├── llm_reasoning.py      # Nemotron (primary classify+explain) + Gemini (secondary, advisory second opinion)
 │   ├── aggregator.py         # Score aggregation, category/action mapping, explanation text
 │   ├── frontend_adapter.py   # Translates internal pipeline output -> React frontend's JSON contract
 │   └── audit_log.py          # Persistent JSONL transaction log
@@ -87,7 +88,9 @@ cp .env.example .env
 
 Edit `.env`:
 ```
-ANTHROPIC_API_KEY=sk-...          # Claude (explanations) — optional, falls back to templates
+NEMOTRON_MODEL_ID=nvidia/nemotron-3.5-lightning-30b-a3b
+GEMINI_API_KEY=...                # Optional — enables the advisory second opinion on elevated risk
+GEMINI_MODEL_ID=gemini-2.0-flash
 NEMOTRON_API_KEY=...              # Nemotron (fraud classification) — optional, falls back to heuristics
 NEMOTRON_API_ENDPOINT=...         # Optional, defaults to NVIDIA API Catalog endpoint
 ```
@@ -105,7 +108,7 @@ cd frontend
 npm install
 npm run dev
 ```
-Frontend dev server runs on `http://localhost:3000` and proxies all `/api/*` calls to the backend on port 8000 (see `frontend/vite.config.ts`). **Both must be running** for real analysis — otherwise the frontend silently falls back to its own client-side heuristic simulator (`frontend/src/services/api.ts`), which is a decent demo fallback but doesn't touch the Python pipeline, Nemotron, or Claude at all.
+Frontend dev server runs on `http://localhost:3000` and proxies all `/api/*` calls to the backend on port 8000 (see `frontend/vite.config.ts`). **Both must be running** for real analysis — otherwise the frontend silently falls back to its own client-side heuristic simulator (`frontend/src/services/api.ts`), which is a decent demo fallback but doesn't touch the Python pipeline or either model at all.
 
 ### 3. Production-style single-origin run (optional)
 
@@ -214,7 +217,7 @@ Exercises `/api/analyze`, `/api/confirm`, `/api/audit-history` directly and prin
 
 - **Single agent, modular internals** — avoids orchestration overhead
 - **Deterministic rules + LLM support** — Rules are the final authority. LLM provides fraud classification (fast) + explanations (high-quality)
-- **Intelligent LLM usage** — Nemotron (lightweight) for routine fraud detection; Claude (expensive) reserved for user-facing explanations and edge cases
+- **Two models, neither one alone decides** — Nemotron classifies and explains every request; Gemini adds an independent second opinion on elevated-risk cases only, purely advisory. Deterministic rules remain the final policy layer regardless of what either model says.
 - **Parallel execution** — independent modules run concurrently
 - **Human-in-the-loop by design** — medium/high risk require explicit user confirmation
 - **Simulated payments** — no real gateway integration
@@ -226,15 +229,17 @@ Payment Request
       ↓
 Rule Engine (deterministic)
       ↓
-Nemotron (fast fraud classification)
+Nemotron — classify + explain (every request)
       ↓
-Risk Score (rule-based with LLM input)
+Risk Score (rules + bounded Nemotron adjustment)
   ┌───┼────┐
  LOW MEDIUM HIGH/CRITICAL
  ↓     ↓     ↓
-Allow  Review Claude explanation
+Allow  Review   Review
+       ↓        ↓
+       Gemini second opinion (advisory only — score unchanged)
              ↓
-        User sees reasoning
+        User sees reasoning + cross-check
 ```
 
-No single LLM decides financial transactions alone.
+No single LLM decides financial transactions alone — and for the cases that matter most, no single LLM even *assesses* them alone.

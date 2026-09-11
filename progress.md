@@ -70,7 +70,12 @@ Categories/actions match the same targets as the heuristic-fallback run exactly 
 
 **Requirement status update:** "Rule-based and LLM-based reasoning" moves from ⚠️ Partial to ✅ Done — the LLM half is no longer just architecture-on-paper, it's a verified live call with real output feeding the real score.
 
-**Still not done:** Claude (explanation generation for Medium/High risk) has not been exercised with a real `ANTHROPIC_API_KEY` yet — user's explicit call, doing it later. Right now Medium/High explanations use the default templated text (`_build_default_explanation`), which is honest and works, just not the "high-quality Claude narrative" half of the hybrid design.
+**Update — Claude dropped, Gemini added as an advisory second opinion.** User has no Anthropic key and doesn't want one. Rather than lose the explanation-quality story, `llm_reasoning.py` was restructured:
+- **Nemotron (primary, every request)** now generates its OWN narrative explanation as part of its existing JSON response (added a `"concern"` field to the prompt) — it no longer needs a second model to write the explanation.
+- **Gemini (secondary, advisory only)** is called ONLY when the running score is already ≥30 (Medium+). It does NOT touch the score at all — deliberately, to avoid re-touching the calibration that took real effort to get right on all 4 scenarios. It returns an agree/disagree + one-sentence independent take, appended to the narrative as a cross-check line.
+- This was a deliberate choice over "Gemini primary, Nemotron secondary" (which the user's own notes suggested as one option) — reasoning: Nemotron is a known-working, calibrated quantity today; making it primary keeps the demo's blast radius small if the new Gemini integration has issues, and preserves the "cheap model runs on everything, selective model only for what matters" pattern the user chose earlier for cost/latency reasons.
+- **No `GEMINI_API_KEY` is configured yet** — the code path is written and compiles, gracefully returns `None`/skips when the key is absent (verified: all 4 scenarios still pass correctly with no Gemini key set, second opinion simply doesn't appear). Not yet exercised against a live Gemini response — that's the next thing to verify once a key is added.
+- `anthropic` removed from `requirements.txt`; `ANTHROPIC_API_KEY` removed from `.env.example`, replaced with `GEMINI_API_KEY`/`GEMINI_MODEL_ID`.
 
 ---
 
@@ -99,7 +104,7 @@ Confirm flow verified independently: VERIFY → confirm → audit log shows `pen
 |---|---|
 | Simulated payment request form/API | ✅ Done |
 | Five internal modules, parallelized where independent | ✅ All five are now real, not stubs (Behavioral Pattern was the last stub, closed this session) |
-| Rule engine + one real LLM call for reasoning/explanation | ✅ Nemotron classification now verified live (4/4 scenarios, real model, see below). Claude explanation still runs on template fallback — real key not yet added (user's call, later). |
+| Rule engine + one real LLM call for reasoning/explanation | ✅ Nemotron (primary, classify+explain) verified live, 4/4 scenarios. Gemini (secondary, advisory-only for elevated risk) is coded and gracefully no-ops without a key — not yet exercised live, no key added yet. |
 | Aggregation and category mapping | ✅ Done, verified 4/4 |
 | Human confirmation UI step | ✅ **Fixed this session** — real confirm/cancel/verify flow in the live React UI, backed by a real endpoint |
 | Persistent audit log | ✅ Done, append-only event trail verified correct |
@@ -109,7 +114,7 @@ Confirm flow verified independently: VERIFY → confirm → audit log shows `pen
 
 ## What's still genuinely open
 
-1. **Live Claude API key never exercised.** Nemotron is now verified live (see above). Claude's `generate_explanation` path is still running on the template fallback — user's explicit call to do this later. Same drop-in-`.env`-and-retest process once ready; no code changes anticipated (the request path is standard Anthropic SDK usage, lower risk than Nemotron's was).
+1. **Live Gemini API key never exercised.** Nemotron (primary) is verified live. Gemini (secondary, advisory second-opinion on Medium+ risk) is coded and compiles, but has never actually received a live response — verified so far only that it gracefully no-ops when `GEMINI_API_KEY` is absent (all 4 scenarios still pass correctly without it). Once a key is added: re-run the 3 scenarios that are Medium+ (New Freelancer, Utility Threat, Crypto Scam — Trusted Friend is Low and won't trigger it) and confirm the second-opinion text actually appears and reads sensibly. Watch for the same category of issues Nemotron hit (wrong endpoint/model id, unexpected response shape) — `_call_gemini`'s error handling prints exactly what fails, same pattern as `_call_nemotron`.
 2. **Dashboard transaction status doesn't re-sync after confirm/cancel.** The Transaction object is added to the dashboard's list at analysis time with its risk-assessed status (SAFE/VERIFY/PAUSED); confirming or cancelling resolves the backend audit trail correctly but doesn't currently flow back to update that already-rendered card's displayed status. Cosmetic — the source of truth (audit log, backend decision) is correct either way — but worth a polish pass if time allows.
 3. **Recipient list reconciliation is scoped to the 4 demo presets**, not the full `mockData.ts` dataset (other mock transactions/recipients in the dashboard are unrelated cosmetic seed data, untouched by the live pipeline).
 4. **No actual browser click-through performed** — everything above is verified via curl/API calls hitting the real running servers, which exercises the exact same code path the browser would, but the visual UI (button states, modal transitions, the OTP-simulation step) has not been eyeballed in an actual browser window this session.

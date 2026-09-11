@@ -2,8 +2,15 @@ import os
 import json
 import re
 import requests
-from anthropic import Anthropic
 from models import PaymentRequest
+
+
+FLAG_TEXT = {
+    "urgency_pressure": "Urgent language detected in payment note.",
+    "threat_pressure": "Coercive language (account block, legal action, penalty) detected.",
+    "impersonation_attempt": "Language suggesting account verification or support request.",
+    "irreversible_payout": "Request for payment via irreversible method (gift card, crypto).",
+}
 
 
 def classify_fraud_intent(
@@ -12,23 +19,24 @@ def classify_fraud_intent(
     rule_score: float,
 ) -> dict:
     """
-    Use Nemotron 3.5 Lightning for fast fraud classification and intent extraction.
-    Returns score adjustment and detected risk factors.
-    Falls back to heuristics if API unavailable.
+    Primary LLM classifier — Nemotron. Runs on every request. Returns a
+    bounded score adjustment, detected red flags, and its own narrative
+    (Nemotron generates the user-facing explanation directly; there's no
+    separate explanation-only model in this build).
+    Falls back to heuristics if the API is unavailable.
     """
     nemotron_key = os.getenv("NEMOTRON_API_KEY")
 
     if nemotron_key:
-        print("    🔍 Attempting Nemotron API call...")
+        print("    Attempting Nemotron API call...")
         result = _call_nemotron(request, recipient_status, rule_score)
         if result:
-            print(f"    ✓ Nemotron returned: {result.get('red_flags', [])}")
+            print(f"    Nemotron returned: {result.get('red_flags', [])}")
             return result
-        print("    ⚠ Nemotron unavailable, falling back to heuristics")
+        print("    Nemotron unavailable, falling back to heuristics")
 
-    # Fallback to heuristic rules
     result = _classify_by_heuristics(request)
-    print(f"    ✓ Using heuristics: {result.get('red_flags', [])}")
+    print(f"    Using heuristics: {result.get('red_flags', [])}")
     return result
 
 
@@ -38,7 +46,8 @@ def _call_nemotron(
     rule_score: float,
 ) -> dict:
     """
-    Call Nemotron 3.5 Lightning API for fraud intent classification.
+    Call Nemotron 3.5 Lightning (NVIDIA NIM) for fraud intent classification
+    AND its own narrative explanation.
     """
     api_key = os.getenv("NEMOTRON_API_KEY")
     api_endpoint = os.getenv(
@@ -59,7 +68,8 @@ Payment:
 Return JSON:
 {{
     "score_adjustment": <integer -15 to 15>,
-    "red_flags": [<list of strings: urgency_pressure, threat_pressure, impersonation_attempt, irreversible_payout, or none>]
+    "red_flags": [<list of strings: urgency_pressure, threat_pressure, impersonation_attempt, irreversible_payout, or none>],
+    "concern": "<one plain-language sentence explaining the primary concern, or null if none>"
 }}"""
 
     try:
@@ -74,8 +84,7 @@ Return JSON:
                 # This Nemotron build is a reasoning model that emits chain-of-thought
                 # before its answer unless told not to. "detailed thinking off" (the
                 # documented toggle for the Nemotron reasoning family) alone didn't
-                # suppress it in testing, so also try the NIM chat_template_kwargs
-                # thinking flag some reasoning models expose.
+                # suppress it in testing — chat_template_kwargs.thinking=false did.
                 "messages": [
                     {"role": "system", "content": "detailed thinking off"},
                     {"role": "user", "content": prompt},
@@ -102,8 +111,6 @@ Return JSON:
             print(f"    Nemotron response had no message content. Full response: {json.dumps(data)[:500]}")
             return None
 
-        # The model may wrap the JSON in markdown fences or extra prose —
-        # find the outermost {...} block rather than assuming it's the whole string.
         json_match = re.search(r"\{.*\}", content, re.DOTALL)
         if not json_match:
             print(f"    Nemotron response had no parseable JSON. Raw content: {content[:300]!r}")
@@ -117,10 +124,13 @@ Return JSON:
 
         score_adjustment = max(-15, min(15, result.get("score_adjustment", 0)))
         red_flags = result.get("red_flags", [])
+        concern = result.get("concern")
+        narrative = concern if concern and concern != "null" else _build_default_explanation(red_flags)
 
         return {
             "score_contribution": score_adjustment,
             "red_flags": red_flags,
+            "narrative": narrative,
             "model": model_id,
         }
 
@@ -131,23 +141,19 @@ Return JSON:
 
 def _classify_by_heuristics(request: PaymentRequest) -> dict:
     """
-    Fallback heuristic fraud classification when API unavailable.
+    Fallback heuristic fraud classification when the Nemotron API is
+    unavailable (no key, or the call failed).
 
     Deliberately conservative weights: this heuristic re-detects largely the
     same keyword families the rule engine (modules.py) already scores, so it
     isn't an independent signal the way a real LLM call would be — giving it
     the full ±15 range would double-count and risk pushing scores past their
-    intended category (e.g. a High-risk scenario tipping into Critical on
-    keyword overlap alone). A real Nemotron/Claude call is free to use more
-    of the ±15 range since its judgment is actually independent of the rules.
+    intended category. A real model call is free to use more of the ±15
+    range since its judgment is actually independent of the rules.
     """
     score_adjustment = 0
     red_flags = []
 
-    # Urgency/threat may legitimately be embedded in a scam handle itself
-    # (e.g. "urgent.power@upi"); impersonation/gift-card are scoped to the
-    # note only, since a real recipient's own name can innocently contain a
-    # word like "electricity" or "bank" without it being impersonation.
     combined_lower = f"{request.note} {request.recipient_name}".lower()
     note_lower = request.note.lower()
 
@@ -167,100 +173,126 @@ def _classify_by_heuristics(request: PaymentRequest) -> dict:
         score_adjustment += 10
         red_flags.append("irreversible_payout")
 
-    # Clamp to ±15
     score_adjustment = max(-15, min(15, score_adjustment))
 
     return {
         "score_contribution": score_adjustment,
         "red_flags": red_flags,
+        "narrative": _build_default_explanation(red_flags),
         "model": "heuristic_fallback",
     }
 
 
-def generate_explanation(
+def _build_default_explanation(fraud_flags: list) -> str:
+    if not fraud_flags:
+        return "Payment appears legitimate based on available information."
+    concerns = [FLAG_TEXT.get(flag, flag) for flag in fraud_flags]
+    return " ".join(concerns)
+
+
+def get_second_opinion(
     request: PaymentRequest,
     recipient_status: str,
-    rule_score: float,
-    fraud_flags: list,
+    primary_red_flags: list,
     final_score: float,
-) -> dict:
+) -> dict | None:
     """
-    Use Claude for user-facing explanation (only for Medium/High risk or complex cases).
-    Reserve Claude for explanation quality, not routine decisions.
-    """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return {
-            "narrative": _build_default_explanation(rule_score, fraud_flags),
-            "model": "default",
-        }
+    Independent second-model check (Gemini) — called only for Medium+ risk
+    (final_score >= 30). Advisory only: it does NOT contribute to the score.
+    The point is a genuine second opinion on cases that matter, not a second
+    vote that could shift a decision the rules engine already made — "we
+    don't rely on a single AI model," without re-touching the calibration
+    that's already been verified against all 4 demo scenarios.
 
-    # Only call Claude for Medium/High risk (optimization)
+    Returns None if no GEMINI_API_KEY is set, if final_score < 30, or if the
+    call fails — callers should treat None as "no second opinion available"
+    and simply not show one, not as an error.
+    """
     if final_score < 30:
-        return {
-            "narrative": _build_default_explanation(rule_score, fraud_flags),
-            "model": "default",
-        }
+        return None
 
-    client = Anthropic()
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None
 
-    flags_text = ", ".join(fraud_flags) if fraud_flags else "none detected"
+    print("    Requesting Gemini second opinion (elevated risk)...")
+    result = _call_gemini(request, recipient_status, primary_red_flags, final_score)
+    if result:
+        print(f"    Gemini second opinion: {'agrees' if result['agrees'] else 'disagrees'} — {result['assessment'][:80]!r}")
+    else:
+        print("    Gemini second opinion unavailable")
+    return result
 
-    prompt = f"""You are a payment security expert. Provide a brief, clear explanation
-for why we're asking the user to review this payment.
 
-Payment Details:
-- Recipient: {request.recipient_name} ({request.recipient_id})
+def _call_gemini(
+    request: PaymentRequest,
+    recipient_status: str,
+    primary_red_flags: list,
+    final_score: float,
+) -> dict | None:
+    api_key = os.getenv("GEMINI_API_KEY")
+    model_id = os.getenv("GEMINI_MODEL_ID", "gemini-2.0-flash")
+    api_endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+
+    flags_text = ", ".join(primary_red_flags) if primary_red_flags else "none"
+
+    prompt = f"""You are an independent second reviewer for a payment security system. Another model
+already flagged this payment as elevated risk (score {final_score:.0f}/100) with these concerns: {flags_text}.
+Give your own independent read — do not just agree by default.
+
+Payment:
+- To: {request.recipient_name} ({request.recipient_id})
 - Amount: ${request.amount}
-- Status: {recipient_status}
-- Risk flags: {flags_text}
-- Current score: {final_score:.0f}/100
+- Recipient status: {recipient_status}
+- Note: "{request.note}"
 
-In 1-2 sentences, explain the primary concern(s) in plain language suitable for a user.
-Focus on the most actionable concern. Be direct but not alarmist."""
+Return ONLY this JSON:
+{{
+    "agrees_with_primary_assessment": <true or false>,
+    "assessment": "<one sentence, your independent take>"
+}}"""
 
     try:
-        message = client.messages.create(
-            model="claude-sonnet-5",  # Use current Sonnet (not 3.5)
-            max_tokens=150,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
+        response = requests.post(
+            f"{api_endpoint}?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
+            },
+            timeout=20,
         )
 
-        narrative = message.content[0].text.strip()
+        if response.status_code != 200:
+            print(f"    Gemini API returned HTTP {response.status_code}: {response.text[:500]!r}")
+            return None
+
+        data = response.json()
+        content = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        if not content:
+            print(f"    Gemini response had no content. Full response: {json.dumps(data)[:500]}")
+            return None
+
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if not json_match:
+            print(f"    Gemini response had no parseable JSON. Raw content: {content[:300]!r}")
+            return None
+
+        result = json.loads(json_match.group())
         return {
-            "narrative": narrative,
-            "model": "claude-sonnet-5",
+            "agrees": bool(result.get("agrees_with_primary_assessment", True)),
+            "assessment": result.get("assessment", ""),
+            "model": model_id,
         }
 
     except Exception as e:
-        return {
-            "narrative": _build_default_explanation(rule_score, fraud_flags),
-            "error": str(e),
-            "model": "default_fallback",
-        }
-
-
-def _build_default_explanation(rule_score: float, fraud_flags: list) -> str:
-    """
-    Fallback explanation when Claude unavailable or for low-risk cases.
-    """
-    if not fraud_flags:
-        return "Payment appears legitimate based on available information."
-
-    explanations = {
-        "urgency_pressure": "Urgent language detected in payment note.",
-        "threat_pressure": "Coercive language (account block, legal action, penalty) detected.",
-        "impersonation_attempt": "Language suggesting account verification or support request.",
-        "irreversible_payout": "Request for payment via irreversible method (gift card, crypto).",
-    }
-
-    concerns = [explanations.get(flag, flag) for flag in fraud_flags]
-    return " ".join(concerns)
+        print(f"    Gemini request failed: {type(e).__name__}: {str(e)}")
+        return None
 
 
 def get_llm_reasoning(
@@ -270,29 +302,28 @@ def get_llm_reasoning(
     final_score: float = None,
 ) -> dict:
     """
-    Hybrid LLM reasoning: fast fraud classification + Claude explanations.
-
-    Returns score adjustment and narrative explanation.
+    Nemotron (primary, always runs) classifies + explains. Gemini (secondary,
+    advisory only) is consulted for elevated-risk cases as an independent
+    check — it never alters the score. Deterministic rules remain the final
+    policy layer regardless of what either model says.
     """
-    # Step 1: Fast fraud classification (Nemotron)
     fraud_result = classify_fraud_intent(request, recipient_status, rule_score)
 
-    # Step 2: Generate explanation (Claude for Medium/High, default for Low)
     if final_score is None:
         final_score = rule_score + fraud_result["score_contribution"]
 
-    explanation_result = generate_explanation(
-        request,
-        recipient_status,
-        rule_score,
-        fraud_result["red_flags"],
-        final_score,
+    narrative = fraud_result["narrative"]
+    second_opinion = get_second_opinion(
+        request, recipient_status, fraud_result["red_flags"], final_score
     )
+    if second_opinion:
+        agreement = "confirms this assessment" if second_opinion["agrees"] else "flags a different concern"
+        narrative = f"{narrative} Independent cross-check {agreement}: {second_opinion['assessment']}"
 
     return {
         "score_contribution": fraud_result["score_contribution"],
         "red_flags": fraud_result["red_flags"],
-        "narrative": explanation_result["narrative"],
+        "narrative": narrative,
         "fraud_model": fraud_result["model"],
-        "explanation_model": explanation_result["model"],
+        "second_opinion_model": second_opinion["model"] if second_opinion else None,
     }
