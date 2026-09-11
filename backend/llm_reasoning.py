@@ -43,8 +43,9 @@ def _call_nemotron(
     api_key = os.getenv("NEMOTRON_API_KEY")
     api_endpoint = os.getenv(
         "NEMOTRON_API_ENDPOINT",
-        "https://api.nemo.nvidia.com/v1/chat/completions"
+        "https://integrate.api.nvidia.com/v1/chat/completions"
     )
+    model_id = os.getenv("NEMOTRON_MODEL_ID", "nvidia/nemotron-3.5-lightning-30b-a3b")
 
     prompt = f"""Analyze this payment request for fraud intent, social engineering, and impersonation.
 Be concise and return ONLY valid JSON.
@@ -69,35 +70,62 @@ Return JSON:
                 "Content-Type": "application/json",
             },
             json={
-                "model": "nemotron-3.5-lightning-30b-a3b",
-                "messages": [{"role": "user", "content": prompt}],
+                "model": model_id,
+                # This Nemotron build is a reasoning model that emits chain-of-thought
+                # before its answer unless told not to. "detailed thinking off" (the
+                # documented toggle for the Nemotron reasoning family) alone didn't
+                # suppress it in testing, so also try the NIM chat_template_kwargs
+                # thinking flag some reasoning models expose.
+                "messages": [
+                    {"role": "system", "content": "detailed thinking off"},
+                    {"role": "user", "content": prompt},
+                ],
                 "temperature": 0.3,
-                "max_tokens": 200,
+                "max_tokens": 1500,
+                "chat_template_kwargs": {"thinking": False},
             },
-            timeout=10,
+            timeout=20,
         )
 
-        if response.status_code == 200:
+        if response.status_code != 200:
+            print(f"    Nemotron API returned HTTP {response.status_code}: {response.text[:500]!r}")
+            return None
+
+        try:
             data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except ValueError:
+            print(f"    Nemotron response body was not valid JSON. Raw body: {response.text[:500]!r}")
+            return None
 
-            # Parse JSON from response
-            json_match = re.search(r"\{[^}]+\}", content)
-            if json_match:
-                result = json.loads(json_match.group())
-                score_adjustment = max(-15, min(15, result.get("score_adjustment", 0)))
-                red_flags = result.get("red_flags", [])
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content:
+            print(f"    Nemotron response had no message content. Full response: {json.dumps(data)[:500]}")
+            return None
 
-                return {
-                    "score_contribution": score_adjustment,
-                    "red_flags": red_flags,
-                    "model": "nemotron-3.5-lightning-30b-a3b",
-                }
+        # The model may wrap the JSON in markdown fences or extra prose —
+        # find the outermost {...} block rather than assuming it's the whole string.
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if not json_match:
+            print(f"    Nemotron response had no parseable JSON. Raw content: {content[:300]!r}")
+            return None
 
-        return None
+        try:
+            result = json.loads(json_match.group())
+        except json.JSONDecodeError as e:
+            print(f"    Could not parse JSON from Nemotron content ({e}). Raw content: {content[:300]!r}")
+            return None
+
+        score_adjustment = max(-15, min(15, result.get("score_adjustment", 0)))
+        red_flags = result.get("red_flags", [])
+
+        return {
+            "score_contribution": score_adjustment,
+            "red_flags": red_flags,
+            "model": model_id,
+        }
 
     except Exception as e:
-        print(f"Nemotron API error: {str(e)}")
+        print(f"    Nemotron request failed: {type(e).__name__}: {str(e)}")
         return None
 
 

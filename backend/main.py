@@ -2,6 +2,9 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Windows consoles / redirected output can default to a non-UTF-8 codepage
 # (cp1252), which crashes on the emoji used in this project's log lines.
 # Force UTF-8 so logging never takes the request down with it.

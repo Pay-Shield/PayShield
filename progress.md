@@ -10,7 +10,7 @@ Last verified: 2026-09-11 (Phase 5 pass — see below). All claims in this file 
 
 **Phase 5 (close the gaps) is done.** All four demo scenarios now land on the correct category/action against the real backend, verified in the natural click-through order (not cherry-picked isolated calls). The human-in-the-loop checkpoint is now real and enforced in the React UI, not just the unused PS09-native flow. Three previously-unknown bugs surfaced *during this fix pass* (not in the original audit) and were fixed too — listed below so nothing gets quietly lost.
 
-**What's still open:** real Nemotron/Claude API keys have never been used in this project — every verified result below ran on the heuristic/template fallback path. That's the one item in the original Phase 5 list not closed out (can't close it without live keys). Dashboard/transaction-list status doesn't yet re-sync after a confirm/cancel decision (cosmetic — the audit log and risk decision are correct either way).
+**Update — real Nemotron is now live and verified.** User added a real `NEMOTRON_API_KEY` (from build.nvidia.com/NIM) and asked to get it actually working. Found and fixed a chain of real bugs to get there — see "Nemotron: from key-added to actually working" below. All 4 demo scenarios re-verified with the live model in the loop. Claude explanation path is still the one thing not yet exercised with a real key (user's call — doing it later). Dashboard/transaction-list status doesn't yet re-sync after a confirm/cancel decision (cosmetic — the audit log and risk decision are correct either way).
 
 ---
 
@@ -46,6 +46,34 @@ Last verified: 2026-09-11 (Phase 5 pass — see below). All claims in this file 
 
 ---
 
+## Nemotron: from key-added to actually working
+
+The user added a real `NEMOTRON_API_KEY` and asked to verify it. It didn't work on the first several attempts — each failure was a distinct, real bug, fixed in sequence:
+
+1. **`.env` was never actually loaded.** `python-dotenv` was in `requirements.txt` but `load_dotenv()` was never called anywhere in the codebase — meaning no API key from `.env` has ever reached any process this entire project, silently, since Phase 1. First request with the "configured" key still hit the fallback with zero attempt at a real call. Fixed: `load_dotenv()` added at the top of `backend/main.py`.
+2. **The endpoint URL was wrong.** `https://api.nemo.nvidia.com/v1/chat/completions` — flagged in this file earlier as a guessed/unverified placeholder, confirmed wrong (plain-text `404 page not found`). Fixed to NVIDIA's real API Catalog endpoint: `https://integrate.api.nvidia.com/v1/chat/completions`.
+3. **The model ID needed an `nvidia/` org prefix.** Updated to `nvidia/nemotron-3.5-lightning-30b-a3b`, now configurable via a new `NEMOTRON_MODEL_ID` env var.
+4. **This Nemotron build is a reasoning model** — it emits extended chain-of-thought ("Here's a thinking process: 1. Analyze User Input...") before its actual answer. At `max_tokens=200` it got cut off mid-thought, never reaching the JSON. Bumping `max_tokens` alone just meant a longer wait before either truncation or a timeout (one attempt hit a 45s read-timeout with `max_tokens=1500` and thinking still not suppressed).
+5. **Fix:** added `"chat_template_kwargs": {"thinking": False}` to the request payload (the standard NIM control for this) alongside a `"detailed thinking off"` system message (which alone hadn't been sufficient). That fixed it — the model now returns a fast, clean JSON answer.
+
+Also hardened `_call_nemotron`'s error handling while debugging this (separate try/except around the HTTP call, the response-body JSON parse, and the content-JSON-extraction parse, each printing exactly what failed) — worth keeping regardless of the specific bug, since the original single broad `except Exception` gave no way to tell "wrong URL" from "malformed JSON" from "timeout" apart, which is exactly what made this take several iterations instead of one.
+
+**Verified working, 4/4 scenarios, live model in the loop** (not the fallback):
+| # | Scenario | Result | Latency | Nemotron red_flags returned |
+|---|---|---|---|---|
+| 1 | Trusted Friend | SAFE / SAFE / score 5 | 1.95s | `['none']` |
+| 2 | New Freelancer | WARNING / VERIFY / score 45 | 9.00s | `['none']` |
+| 3 | Utility Threat Scam | HIGH / PAUSED / score 82 | 5.02s | `urgency_pressure, threat_pressure, impersonation_attempt, irreversible_payout` |
+| 4 | Crypto Syndicate Scam | CRITICAL / BLOCKED / score 100 | 2.19s | `impersonation_attempt, irreversible_payout, urgency_pressure` |
+
+Categories/actions match the same targets as the heuristic-fallback run exactly (scores shifted slightly — e.g. scenario 1's 0→5, scenario 2's 40→45 — because the real model's independent judgment adds a small positive adjustment even on the clean cases; still comfortably within each category's range). Latency (2-9s) is genuine NVIDIA-hosted inference time, not local overhead — worth knowing for the demo, but the Payment Simulator's existing "PAYSHIELD IS CHECKING..." animated loading sequence already covers a few seconds of wait, so this fits the existing UX rather than requiring new work.
+
+**Requirement status update:** "Rule-based and LLM-based reasoning" moves from ⚠️ Partial to ✅ Done — the LLM half is no longer just architecture-on-paper, it's a verified live call with real output feeding the real score.
+
+**Still not done:** Claude (explanation generation for Medium/High risk) has not been exercised with a real `ANTHROPIC_API_KEY` yet — user's explicit call, doing it later. Right now Medium/High explanations use the default templated text (`_build_default_explanation`), which is honest and works, just not the "high-quality Claude narrative" half of the hybrid design.
+
+---
+
 ## Verified: all 4 demo scenarios, real backend, natural sequence
 
 Run in order in one session (so velocity/session-state is realistic, not cherry-picked):
@@ -71,7 +99,7 @@ Confirm flow verified independently: VERIFY → confirm → audit log shows `pen
 |---|---|
 | Simulated payment request form/API | ✅ Done |
 | Five internal modules, parallelized where independent | ✅ All five are now real, not stubs (Behavioral Pattern was the last stub, closed this session) |
-| Rule engine + one real LLM call for reasoning/explanation | ⚠️ Hybrid code path complete and correctly calibrated on the fallback path; **still never exercised with a live Nemotron or Claude key** |
+| Rule engine + one real LLM call for reasoning/explanation | ✅ Nemotron classification now verified live (4/4 scenarios, real model, see below). Claude explanation still runs on template fallback — real key not yet added (user's call, later). |
 | Aggregation and category mapping | ✅ Done, verified 4/4 |
 | Human confirmation UI step | ✅ **Fixed this session** — real confirm/cancel/verify flow in the live React UI, backed by a real endpoint |
 | Persistent audit log | ✅ Done, append-only event trail verified correct |
@@ -81,7 +109,7 @@ Confirm flow verified independently: VERIFY → confirm → audit log shows `pen
 
 ## What's still genuinely open
 
-1. **Live Nemotron/Claude API keys never exercised.** Everything verified above ran the heuristic/template fallback. If you have keys, drop them in `.env` and re-run the 4-scenario check — worth doing at least once before submission to confirm the real API JSON-parsing path works (`_call_nemotron`'s response parsing, Claude's `generate_explanation` prompt) and not just the fallback.
+1. **Live Claude API key never exercised.** Nemotron is now verified live (see above). Claude's `generate_explanation` path is still running on the template fallback — user's explicit call to do this later. Same drop-in-`.env`-and-retest process once ready; no code changes anticipated (the request path is standard Anthropic SDK usage, lower risk than Nemotron's was).
 2. **Dashboard transaction status doesn't re-sync after confirm/cancel.** The Transaction object is added to the dashboard's list at analysis time with its risk-assessed status (SAFE/VERIFY/PAUSED); confirming or cancelling resolves the backend audit trail correctly but doesn't currently flow back to update that already-rendered card's displayed status. Cosmetic — the source of truth (audit log, backend decision) is correct either way — but worth a polish pass if time allows.
 3. **Recipient list reconciliation is scoped to the 4 demo presets**, not the full `mockData.ts` dataset (other mock transactions/recipients in the dashboard are unrelated cosmetic seed data, untouched by the live pipeline).
 4. **No actual browser click-through performed** — everything above is verified via curl/API calls hitting the real running servers, which exercises the exact same code path the browser would, but the visual UI (button states, modal transitions, the OTP-simulation step) has not been eyeballed in an actual browser window this session.
