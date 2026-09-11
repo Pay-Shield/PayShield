@@ -58,3 +58,27 @@ class AuditLogEntry(BaseModel):
 class UserConfirmation(BaseModel):
     confirmed: bool
     verification_passed: Optional[bool] = None
+
+
+# --- Frontend (React) contract models — src/types.ts ---------------------
+
+class AnalyzePaymentPayload(BaseModel):
+    """Matches AnalyzePaymentPayload in frontend/src/types.ts"""
+    recipientName: str
+    upiId: str
+    amount: float
+    message: Optional[str] = ""
+
+
+class ScamCheckPayload(BaseModel):
+    message: str
+
+
+def payment_payload_to_request(payload: AnalyzePaymentPayload, sender_id: str = "frontend_user") -> PaymentRequest:
+    return PaymentRequest(
+        sender_id=sender_id,
+        recipient_name=payload.recipientName,
+        recipient_id=payload.upiId,
+        amount=payload.amount,
+        note=payload.message or "",
+    )

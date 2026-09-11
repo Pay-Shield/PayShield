@@ -1,18 +1,25 @@
+import time
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
-from models import PaymentRequest, UserConfirmation, RiskAnalysisResult
-from modules import recipient_verification, risk_analysis_rules, behavioral_pattern
-from llm_reasoning import get_llm_reasoning
-from aggregator import aggregate_and_decide, format_explanation
+
+from models import (
+    PaymentRequest,
+    RiskAnalysisResult,
+    AnalyzePaymentPayload,
+    ScamCheckPayload,
+    payment_payload_to_request,
+)
+from pipeline import run_risk_pipeline
+from llm_reasoning import classify_fraud_intent
+from frontend_adapter import map_to_analyze_response, check_scam_message
 from audit_log import log_transaction, get_audit_history
-import os
 
 app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,101 +28,111 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static files (HTML, TypeScript, etc.)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/")
+    async def root():
+        return FileResponse(FRONTEND_DIST / "index.html")
 
 
-@app.get("/")
-async def root():
-    return FileResponse("static/index.html")
+# ============================================================================
+# Frontend contract endpoints — consumed by frontend/src/services/api.ts
+# ============================================================================
 
+@app.post("/api/transactions/analyze")
+async def analyze_transaction(payload: AnalyzePaymentPayload):
+    """
+    Contract expected by the React frontend (AnalyzePaymentPayload ->
+    AnalyzePaymentResponse in frontend/src/types.ts). Runs the same five-module
+    pipeline as /api/analyze, then translates category/action vocabulary and
+    persists the attempt to the audit log.
+    """
+    start = time.monotonic()
+    request = payment_payload_to_request(payload)
+
+    try:
+        pipeline_result = await run_risk_pipeline(request)
+    except Exception as e:
+        print(f"❌ Error in analyze_transaction: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+
+    elapsed = time.monotonic() - start
+    response = map_to_analyze_response(pipeline_result, elapsed)
+
+    decision = pipeline_result["decision"]
+    outcome = {
+        "SAFE": "completed",
+        "VERIFY": "pending_confirmation",
+        "PAUSED": "pending_verification",
+        "BLOCKED": "blocked",
+    }.get(response["action"], "pending_confirmation")
+
+    log_transaction(
+        request=request,
+        recipient_verification=pipeline_result["recipient_result"],
+        risk_factors=pipeline_result["all_factors"],
+        llm_reasoning=pipeline_result["explanation"],
+        final_score=decision["final_score"],
+        category=decision["category"],
+        action=decision["action"],
+        outcome=outcome,
+    )
+
+    return response
+
+
+@app.post("/api/security/scam-check")
+async def scam_check(payload: ScamCheckPayload):
+    """
+    Contract expected by the React frontend (message -> ScamCheckResult in
+    frontend/src/types.ts). Standalone text analysis, no payment involved.
+    """
+    fake_request = PaymentRequest(
+        sender_id="scam_check",
+        recipient_name="",
+        recipient_id="",
+        amount=0,
+        note=payload.message,
+    )
+    fraud_result = classify_fraud_intent(fake_request, recipient_status="unknown", rule_score=0)
+    return check_scam_message(payload.message, fraud_result.get("red_flags", []))
+
+
+# ============================================================================
+# PS09 native endpoints — internal vocabulary (low/medium/high/critical,
+# auto_approve/require_confirmation/require_verification/hard_block)
+# ============================================================================
 
 @app.post("/api/analyze")
-async def analyze_payment(request: PaymentRequest):
+async def analyze_payment(request: PaymentRequest) -> RiskAnalysisResult:
     """
-    Main endpoint: analyze payment through all modules.
-    Returns risk score, category, action, and explanation.
+    Analyze payment through all modules. Returns risk score, category,
+    action, and explanation in PayShield's native vocabulary.
     """
     try:
-        print(f"\n📊 Analyzing payment: {request.recipient_name} for ${request.amount}")
-
-        # Run modules in parallel where possible
-        recipient_result, rule_result, behavioral_result = await asyncio.gather(
-            asyncio.to_thread(recipient_verification, request),
-            asyncio.to_thread(risk_analysis_rules, request),
-            asyncio.to_thread(behavioral_pattern, request),
-        )
-
-        print(f"  ✓ Recipient: {recipient_result.get('status')}")
-        print(f"  ✓ Rules: {rule_result['score']:.0f}")
-        print(f"  ✓ Behavioral: {behavioral_result['score']:.0f}")
-
-        # Get LLM reasoning (can also run in parallel)
-        # Pre-calculate tentative score for LLM to decide if Claude explanation is needed
-        tentative_score = (
-            recipient_result.get("score_contribution", 0) +
-            rule_result["score"] +
-            behavioral_result["score"]
-        )
-
-        print(f"  🤖 Calling LLM for fraud classification...")
-        llm_result = await asyncio.to_thread(
-            get_llm_reasoning,
-            request,
-            recipient_result.get("status", "unknown"),
-            rule_result["score"],
-            tentative_score,
-        )
-        print(f"  ✓ LLM Model: {llm_result.get('fraud_model', 'unknown')}")
-        print(f"  ✓ LLM Adjustment: {llm_result.get('score_contribution', 0)}")
-
-        # Aggregate all scores
-        decision = aggregate_and_decide(
-            recipient_score=recipient_result.get("score_contribution", 0),
-            rule_score=rule_result["score"],
-            behavioral_score=behavioral_result["score"],
-            llm_adjustment=llm_result.get("score_contribution", 0),
-        )
-
-        print(f"  📈 Final Score: {decision['final_score']:.0f}")
-        print(f"  🎯 Category: {decision['category']}")
-        print(f"  ⚡ Action: {decision['action']}")
-
-        # Combine all factors
-        all_factors = (
-            rule_result.get("factors", []) +
-            behavioral_result.get("factors", []) +
-            [{"type": "llm_red_flags", "flags": llm_result.get("red_flags", [])}]
-        )
-
-        # Format explanation
-        explanation = format_explanation(
-            category=decision["category"],
-            final_score=decision["final_score"],
-            factors=all_factors,
-            llm_narrative=llm_result.get("narrative", ""),
-        )
-
-        return RiskAnalysisResult(
-            risk_score=decision["final_score"],
-            category=decision["category"],
-            action=decision["action"],
-            factors=all_factors,
-            llm_reasoning=explanation,
-            confidence=0.85,
-        )
-
+        pipeline_result = await run_risk_pipeline(request)
     except Exception as e:
         print(f"❌ Error in analyze_payment: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
 
+    decision = pipeline_result["decision"]
+    return RiskAnalysisResult(
+        risk_score=decision["final_score"],
+        category=decision["category"],
+        action=decision["action"],
+        factors=pipeline_result["all_factors"],
+        llm_reasoning=pipeline_result["explanation"],
+        confidence=0.85,
+    )
+
 
 @app.post("/api/confirm")
-async def confirm_payment(
-    body: dict = Body(...)
-):
+async def confirm_payment(body: dict = Body(...)):
     """
-    Handle user confirmation/cancellation.
+    Handle user confirmation/cancellation for the PS09 native flow.
     Expects: {"request": PaymentRequest, "confirmed": bool}
     """
     try:
@@ -125,18 +142,14 @@ async def confirm_payment(
         if not request_data:
             raise HTTPException(status_code=400, detail="Missing payment request data")
 
-        # Reconstruct PaymentRequest object
         request = PaymentRequest(**request_data)
 
         if confirmed:
-            # Re-run analysis to get final decision
             analysis = await analyze_payment(request)
 
             if analysis.category.lower() in ["low", "medium", "high"]:
-                # Allowed to proceed
                 outcome = "completed"
             else:
-                # CRITICAL: cannot proceed
                 outcome = "blocked"
                 log_transaction(
                     request=request,
@@ -150,7 +163,6 @@ async def confirm_payment(
                 )
                 raise HTTPException(status_code=403, detail="Payment blocked: too high risk.")
 
-            # Log to audit
             log_transaction(
                 request=request,
                 recipient_verification={},
@@ -164,7 +176,6 @@ async def confirm_payment(
 
             return {"status": "completed", "message": "Payment processed successfully."}
         else:
-            # User cancelled
             log_transaction(
                 request=request,
                 recipient_verification={},
@@ -186,9 +197,6 @@ async def confirm_payment(
 
 @app.get("/api/audit-history")
 async def get_history(limit: int = 50):
-    """
-    Retrieve audit log history.
-    """
     return get_audit_history(limit)
 
 
