@@ -46,6 +46,15 @@ export const PaymentSimulatorModal: React.FC<PaymentSimulatorModalProps> = ({
   const [checkingStep, setCheckingStep] = useState(0);
   const [analysisResult, setAnalysisResult] = useState<AnalyzePaymentResponse | null>(null);
   const [createdTxn, setCreatedTxn] = useState<Transaction | null>(null);
+  const [viaBackend, setViaBackend] = useState(false);
+
+  // Human-in-the-loop checkpoint state (guardian-architecture.md §4 step 4:
+  // Medium/High risk must not complete without an explicit user decision).
+  type ConfirmState = 'none' | 'needs_confirm' | 'needs_verify_then_confirm' | 'resolving' | 'resolved';
+  const [confirmState, setConfirmState] = useState<ConfirmState>('none');
+  const [identityVerified, setIdentityVerified] = useState(false);
+  const [resolvedOutcome, setResolvedOutcome] = useState<'completed' | 'cancelled' | null>(null);
+  const [resolveError, setResolveError] = useState<string | null>(null);
 
   const presets = [
     {
@@ -111,15 +120,51 @@ export const PaymentSimulatorModal: React.FC<PaymentSimulatorModalProps> = ({
     const timer3 = setTimeout(() => setCheckingStep(3), 1050);
     const timer4 = setTimeout(() => setCheckingStep(4), 1400);
 
-    const res = await paymentApiService.analyzePayment(payload);
+    const { data: res, viaBackend: usedBackend } = await paymentApiService.analyzePayment(payload);
 
     setTimeout(() => {
       setAnalysisResult(res);
+      setViaBackend(usedBackend);
       const newTxn = buildTransactionFromSimulation(payload, res);
       setCreatedTxn(newTxn);
       onTransactionCreated(newTxn);
       setStage('result');
+
+      // SAFE completes automatically (guardian-architecture.md: HITL checkpoint
+      // is "skipped only for Low"). BLOCKED is already terminal — no override
+      // exists, so there's nothing to confirm. VERIFY/PAUSED must wait for an
+      // explicit user decision below before they're considered resolved.
+      if (res.action === 'VERIFY') {
+        setConfirmState('needs_confirm');
+      } else if (res.action === 'PAUSED') {
+        setConfirmState('needs_verify_then_confirm');
+      } else {
+        setConfirmState('none');
+      }
     }, 1800);
+  };
+
+  const handleVerifyIdentity = () => {
+    setIdentityVerified(true);
+  };
+
+  const resolveTransaction = async (confirmed: boolean) => {
+    if (!analysisResult) return;
+    setConfirmState('resolving');
+    setResolveError(null);
+    try {
+      if (viaBackend) {
+        await paymentApiService.confirmTransaction(analysisResult.transaction_id, confirmed);
+      }
+      setResolvedOutcome(confirmed ? 'completed' : 'cancelled');
+    } catch (e) {
+      // Backend refused (e.g. re-scored as blocked between analyze and confirm) —
+      // surface it plainly rather than silently pretending it succeeded.
+      setResolveError(e instanceof Error ? e.message : 'Could not record your decision.');
+      setResolvedOutcome('cancelled');
+    } finally {
+      setConfirmState('resolved');
+    }
   };
 
   const handleReset = () => {
@@ -127,6 +172,11 @@ export const PaymentSimulatorModal: React.FC<PaymentSimulatorModalProps> = ({
     setAnalysisResult(null);
     setCreatedTxn(null);
     setCheckingStep(0);
+    setViaBackend(false);
+    setConfirmState('none');
+    setIdentityVerified(false);
+    setResolvedOutcome(null);
+    setResolveError(null);
   };
 
   const stepsList = [
@@ -349,7 +399,66 @@ export const PaymentSimulatorModal: React.FC<PaymentSimulatorModalProps> = ({
               </ul>
             </div>
 
-            {/* Actions */}
+            {/* Human-in-the-loop checkpoint — required for VERIFY/PAUSED, per
+                guardian-architecture.md §4 step 4. SAFE/BLOCKED never reach here. */}
+            {confirmState === 'needs_verify_then_confirm' && !identityVerified && (
+              <div className="p-4 rounded-xl bg-[#0B1120] border border-amber-500/30 space-y-3">
+                <h5 className="text-xs font-bold uppercase tracking-wider text-amber-300">
+                  Identity Verification Required
+                </h5>
+                <p className="text-xs text-slate-300">
+                  This payment is High risk. Complete a one-time identity check (simulated) before you can confirm or cancel it.
+                </p>
+                <Button variant="outline" size="sm" onClick={handleVerifyIdentity}>
+                  Simulate OTP Verification
+                </Button>
+              </div>
+            )}
+
+            {(confirmState === 'needs_confirm' ||
+              (confirmState === 'needs_verify_then_confirm' && identityVerified)) && (
+              <div className="p-4 rounded-xl bg-[#0B1120] border border-slate-800 space-y-3">
+                <h5 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                  Your Decision Required
+                </h5>
+                <p className="text-xs text-slate-300">
+                  PayShield will not process this payment until you explicitly confirm.
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => resolveTransaction(true)}
+                    className="bg-emerald-600 hover:bg-emerald-500"
+                  >
+                    Confirm &amp; Proceed
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => resolveTransaction(false)}>
+                    Cancel Payment
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {confirmState === 'resolving' && (
+              <div className="text-xs text-slate-400">Recording your decision...</div>
+            )}
+
+            {confirmState === 'resolved' && resolvedOutcome === 'completed' && (
+              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300">
+                You confirmed this payment — recorded as completed in the audit log.
+              </div>
+            )}
+
+            {confirmState === 'resolved' && resolvedOutcome === 'cancelled' && (
+              <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300">
+                {resolveError ? `${resolveError} Payment was not processed.` : 'Payment cancelled — not processed.'}
+              </div>
+            )}
+
+            {/* Actions — hidden while a decision is still pending, so a
+                risky payment can't be waved through by just closing the modal. */}
+            {(confirmState === 'none' || confirmState === 'resolved') && (
             <div className="pt-3 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
               <Button
                 variant="outline"
@@ -379,6 +488,7 @@ export const PaymentSimulatorModal: React.FC<PaymentSimulatorModalProps> = ({
                 </Button>
               </div>
             </div>
+            )}
           </motion.div>
         )}
       </div>

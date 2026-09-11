@@ -3,6 +3,7 @@ from models import PaymentRequest
 from modules import recipient_verification, risk_analysis_rules, behavioral_pattern
 from llm_reasoning import get_llm_reasoning
 from aggregator import aggregate_and_decide, format_explanation
+from session_store import get_recent_attempts, record_attempt
 
 
 async def run_risk_pipeline(request: PaymentRequest) -> dict:
@@ -14,15 +15,20 @@ async def run_risk_pipeline(request: PaymentRequest) -> dict:
     """
     print(f"\n📊 Analyzing payment: {request.recipient_name} for ${request.amount}")
 
+    session_history = get_recent_attempts(request.sender_id)
+
     recipient_result, rule_result, behavioral_result = await asyncio.gather(
         asyncio.to_thread(recipient_verification, request),
         asyncio.to_thread(risk_analysis_rules, request),
-        asyncio.to_thread(behavioral_pattern, request),
+        asyncio.to_thread(behavioral_pattern, request, session_history),
     )
+
+    # Record this attempt AFTER computing velocity so it doesn't count itself
+    record_attempt(request.sender_id, request.recipient_id, recipient_result.get("status", "new"))
 
     print(f"  ✓ Recipient: {recipient_result.get('status')}")
     print(f"  ✓ Rules: {rule_result['score']:.0f}")
-    print(f"  ✓ Behavioral: {behavioral_result['score']:.0f}")
+    print(f"  ✓ Behavioral: {behavioral_result['score']:.0f} (session has {len(session_history)} prior attempt(s))")
 
     tentative_score = (
         recipient_result.get("score_contribution", 0) +

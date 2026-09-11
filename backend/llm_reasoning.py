@@ -58,7 +58,7 @@ Payment:
 Return JSON:
 {{
     "score_adjustment": <integer -15 to 15>,
-    "red_flags": [<list of strings: urgency_pressure, impersonation_attempt, irreversible_payout, or none>]
+    "red_flags": [<list of strings: urgency_pressure, threat_pressure, impersonation_attempt, irreversible_payout, or none>]
 }}"""
 
     try:
@@ -104,23 +104,39 @@ Return JSON:
 def _classify_by_heuristics(request: PaymentRequest) -> dict:
     """
     Fallback heuristic fraud classification when API unavailable.
+
+    Deliberately conservative weights: this heuristic re-detects largely the
+    same keyword families the rule engine (modules.py) already scores, so it
+    isn't an independent signal the way a real LLM call would be — giving it
+    the full ±15 range would double-count and risk pushing scores past their
+    intended category (e.g. a High-risk scenario tipping into Critical on
+    keyword overlap alone). A real Nemotron/Claude call is free to use more
+    of the ±15 range since its judgment is actually independent of the rules.
     """
     score_adjustment = 0
     red_flags = []
 
+    # Urgency/threat may legitimately be embedded in a scam handle itself
+    # (e.g. "urgent.power@upi"); impersonation/gift-card are scoped to the
+    # note only, since a real recipient's own name can innocently contain a
+    # word like "electricity" or "bank" without it being impersonation.
+    combined_lower = f"{request.note} {request.recipient_name}".lower()
     note_lower = request.note.lower()
 
-    # Intent patterns
-    if any(word in note_lower for word in ["urgent", "immediately", "asap", "hurry"]):
-        score_adjustment += 10
+    if re.search(r"\burgent(ly)?\b|\bimmediate(ly)?\b|\basap\b|\bhurry\b|\btonight\b|\bexpir\w*\b", combined_lower):
+        score_adjustment += 6
         red_flags.append("urgency_pressure")
 
-    if any(word in note_lower for word in ["verify", "confirm", "bank", "support", "kyc"]):
-        score_adjustment += 15
+    if re.search(r"\bblock(ed)?\b|\bdisconnect\w*\b|\bsuspend\w*\b|\barrest\w*\b|\bpolice\b|\bpenalty\b|\bfine\b", combined_lower):
+        score_adjustment += 6
+        red_flags.append("threat_pressure")
+
+    if re.search(r"\bverify\b|\bconfirm\b|\bbank\b|\bsupport\b|\bkyc\b|\botp\b|\brefund\b", note_lower):
+        score_adjustment += 10
         red_flags.append("impersonation_attempt")
 
-    if any(word in note_lower for word in ["gift card", "crypto", "bitcoin", "voucher"]):
-        score_adjustment += 12
+    if re.search(r"gift\s*card|\bcrypto\b|\bbitcoin\b|\bvoucher\b|guaranteed.{0,20}return", note_lower):
+        score_adjustment += 10
         red_flags.append("irreversible_payout")
 
     # Clamp to ±15
@@ -210,6 +226,7 @@ def _build_default_explanation(rule_score: float, fraud_flags: list) -> str:
 
     explanations = {
         "urgency_pressure": "Urgent language detected in payment note.",
+        "threat_pressure": "Coercive language (account block, legal action, penalty) detected.",
         "impersonation_attempt": "Language suggesting account verification or support request.",
         "irreversible_payout": "Request for payment via irreversible method (gift card, crypto).",
     }
@@ -246,6 +263,7 @@ def get_llm_reasoning(
 
     return {
         "score_contribution": fraud_result["score_contribution"],
+        "red_flags": fraud_result["red_flags"],
         "narrative": explanation_result["narrative"],
         "fraud_model": fraud_result["model"],
         "explanation_model": explanation_result["model"],

@@ -10,6 +10,17 @@ import {
 
 const API_BASE_URL = '/api';
 
+export interface AnalyzeResult {
+  data: AnalyzePaymentResponse;
+  /** True if this came from the real Python pipeline, false if the client-side fallback simulator ran instead. */
+  viaBackend: boolean;
+}
+
+export interface ConfirmResult {
+  status: 'completed' | 'cancelled';
+  message: string;
+}
+
 /**
  * Service layer prepared for integration with a FastAPI or Express backend.
  * Provides realistic high-precision heuristic simulation when backend is unavailable.
@@ -19,7 +30,7 @@ export const paymentApiService = {
    * Analyze transaction payload before execution.
    * Target endpoint: POST /api/transactions/analyze
    */
-  async analyzePayment(payload: AnalyzePaymentPayload): Promise<AnalyzePaymentResponse> {
+  async analyzePayment(payload: AnalyzePaymentPayload): Promise<AnalyzeResult> {
     try {
       // Attempt real backend call if configured
       const response = await fetch(`${API_BASE_URL}/transactions/analyze`, {
@@ -29,14 +40,36 @@ export const paymentApiService = {
       });
 
       if (response.ok) {
-        return await response.json();
+        return { data: await response.json(), viaBackend: true };
       }
     } catch {
       // Graceful fallback to client-side risk engine
     }
 
     // Client-side intelligent risk engine simulator
-    return simulateRiskAnalysis(payload);
+    return { data: simulateRiskAnalysis(payload), viaBackend: false };
+  },
+
+  /**
+   * Resolve the human-in-the-loop checkpoint for a VERIFY/PAUSED transaction
+   * returned by analyzePayment. Only call this when that result's
+   * viaBackend was true — a fallback-simulated transaction has nothing
+   * server-side to confirm.
+   * Target endpoint: POST /api/transactions/confirm
+   */
+  async confirmTransaction(transactionId: string, confirmed: boolean): Promise<ConfirmResult> {
+    const response = await fetch(`${API_BASE_URL}/transactions/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transaction_id: transactionId, confirmed }),
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ detail: 'Confirmation failed' }));
+      throw new Error(err.detail || `Confirmation failed (${response.status})`);
+    }
+
+    return response.json();
   },
 
   /**

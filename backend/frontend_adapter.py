@@ -62,6 +62,8 @@ def build_breakdown(all_factors: list, recipient_result: dict) -> dict:
 
     social_weight = (
         _factor_weight(all_factors, "urgency_language") +
+        _factor_weight(all_factors, "threat_language") +
+        _factor_weight(all_factors, "coercive_pressure") +
         _factor_weight(all_factors, "impersonation_language") +
         _factor_weight(all_factors, "gift_card_request")
     )
@@ -95,6 +97,8 @@ def build_reasons(all_factors: list, llm_result: dict, recipient_result: dict) -
         "amount_5x_baseline": "Transfer amount is more than 5x your typical spend baseline",
         "amount_2_5x_baseline": "Transfer amount is 2-5x your typical spend baseline",
         "urgency_language": "High-urgency language detected requiring immediate transfer",
+        "threat_language": "Coercive language detected (account block, legal action, penalty)",
+        "coercive_pressure": "Urgency combined with threat/coercion language detected",
         "impersonation_language": "Language suggesting bank/support impersonation or identity verification request",
         "gift_card_request": "Request for payment via irreversible method (gift card / crypto)",
         "high_velocity": "Multiple new-recipient payment attempts in this session",
@@ -114,8 +118,12 @@ def build_reasons(all_factors: list, llm_result: dict, recipient_result: dict) -
     elif status == "known":
         reasons.append("Recipient verified in trusted payee directory")
 
+    # Only append the LLM narrative if it adds information beyond the factor
+    # list above — the generic "appears legitimate" fallback text is noise
+    # (and actively contradictory) when real risk factors were just listed.
     narrative = llm_result.get("narrative")
-    if narrative and narrative not in reasons:
+    is_generic_fallback = narrative == "Payment appears legitimate based on available information."
+    if narrative and narrative not in reasons and not (is_generic_fallback and reasons):
         reasons.append(narrative)
 
     if not reasons:

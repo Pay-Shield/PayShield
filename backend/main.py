@@ -1,5 +1,13 @@
+import sys
 import time
 from pathlib import Path
+
+# Windows consoles / redirected output can default to a non-UTF-8 codepage
+# (cp1252), which crashes on the emoji used in this project's log lines.
+# Force UTF-8 so logging never takes the request down with it.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse
@@ -17,6 +25,7 @@ from pipeline import run_risk_pipeline
 from llm_reasoning import classify_fraud_intent
 from frontend_adapter import map_to_analyze_response, check_scam_message
 from audit_log import log_transaction, get_audit_history
+from pending_store import store_pending, pop_pending
 
 app = FastAPI()
 
@@ -70,6 +79,7 @@ async def analyze_transaction(payload: AnalyzePaymentPayload):
         "BLOCKED": "blocked",
     }.get(response["action"], "pending_confirmation")
 
+    # Always log the analysis attempt itself, regardless of what happens next.
     log_transaction(
         request=request,
         recipient_verification=pipeline_result["recipient_result"],
@@ -81,7 +91,82 @@ async def analyze_transaction(payload: AnalyzePaymentPayload):
         outcome=outcome,
     )
 
+    # Human-in-the-loop checkpoint (guardian-architecture.md §4 step 4):
+    # SAFE is the only action allowed to complete without an explicit user
+    # decision. VERIFY/PAUSED/BLOCKED are held here until the frontend calls
+    # /api/transactions/confirm — BLOCKED is stored too so confirm can still
+    # explain "no override available" rather than a bare 404.
+    if response["action"] != "SAFE":
+        store_pending(response["transaction_id"], {
+            "request": request.model_dump(),
+            "decision": decision,
+            "all_factors": pipeline_result["all_factors"],
+            "explanation": pipeline_result["explanation"],
+        })
+
     return response
+
+
+@app.post("/api/transactions/confirm")
+async def confirm_transaction(body: dict = Body(...)):
+    """
+    Resolve a pending VERIFY/PAUSED decision from /api/transactions/analyze.
+    Expects: {"transaction_id": str, "confirmed": bool}
+
+    This is the human-in-the-loop checkpoint the React Payment Simulator was
+    previously missing — Medium/High risk payments are not considered
+    "completed" until the user explicitly confirms here. Critical/BLOCKED
+    payments always reject: no override path exists, by design.
+    """
+    transaction_id = body.get("transaction_id")
+    confirmed = body.get("confirmed", False)
+
+    if not transaction_id:
+        raise HTTPException(status_code=400, detail="Missing transaction_id")
+
+    pending = pop_pending(transaction_id)
+    if pending is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No pending decision found for this transaction (already resolved, expired, or was auto-approved).",
+        )
+
+    request = PaymentRequest(**pending["request"])
+    decision = pending["decision"]
+
+    if decision["action"] == "hard_block":
+        log_transaction(
+            request=request,
+            recipient_verification={},
+            risk_factors=pending["all_factors"],
+            llm_reasoning=pending["explanation"],
+            final_score=decision["final_score"],
+            category=decision["category"],
+            action=decision["action"],
+            outcome="blocked",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="This payment is blocked due to Critical fraud risk. No override is available.",
+        )
+
+    outcome = "completed" if confirmed else "cancelled"
+
+    log_transaction(
+        request=request,
+        recipient_verification={},
+        risk_factors=pending["all_factors"],
+        llm_reasoning=pending["explanation"],
+        final_score=decision["final_score"],
+        category=decision["category"],
+        action=decision["action"],
+        outcome=outcome,
+    )
+
+    if confirmed:
+        return {"status": "completed", "message": "Payment confirmed and processed successfully.", "transaction_id": transaction_id}
+    else:
+        return {"status": "cancelled", "message": "Payment cancelled by user.", "transaction_id": transaction_id}
 
 
 @app.post("/api/security/scam-check")
