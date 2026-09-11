@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from datetime import datetime
 from enum import Enum
@@ -33,9 +33,11 @@ class ModuleOutput(BaseModel):
 
 
 class RiskAnalysisResult(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
     risk_score: float
-    category: RiskCategory
-    action: ActionType
+    category: str  # Will be a string from enum
+    action: str    # Will be a string from enum
     factors: list[dict]
     llm_reasoning: str
     confidence: float

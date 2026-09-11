@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from models import PaymentRequest
-
+import os
 
 AUDIT_LOG_FILE = "audit_log.jsonl"
 
@@ -38,8 +38,12 @@ def log_transaction(
         "outcome": outcome,
     }
 
-    with open(AUDIT_LOG_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    try:
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        print(f"✓ Logged transaction: {request.recipient_name} - {outcome.upper()}")
+    except Exception as e:
+        print(f"⚠ Failed to log transaction: {str(e)}")
 
 
 def get_audit_history(limit: int = 50) -> list:

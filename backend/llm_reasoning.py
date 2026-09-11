@@ -19,12 +19,17 @@ def classify_fraud_intent(
     nemotron_key = os.getenv("NEMOTRON_API_KEY")
 
     if nemotron_key:
+        print("    🔍 Attempting Nemotron API call...")
         result = _call_nemotron(request, recipient_status, rule_score)
         if result:
+            print(f"    ✓ Nemotron returned: {result.get('red_flags', [])}")
             return result
+        print("    ⚠ Nemotron unavailable, falling back to heuristics")
 
     # Fallback to heuristic rules
-    return _classify_by_heuristics(request)
+    result = _classify_by_heuristics(request)
+    print(f"    ✓ Using heuristics: {result.get('red_flags', [])}")
+    return result
 
 
 def _call_nemotron(

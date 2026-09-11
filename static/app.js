@@ -39,22 +39,26 @@ async function handlePaymentSubmit(event) {
 
     try {
         // Analyze payment
+        console.log('Analyzing payment:', request);
         const response = await fetch(`${API_BASE}/analyze`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(request),
         });
 
-        if (!response.ok) {
-            throw new Error(`API error: ${response.status}`);
-        }
-
+        console.log('Analysis response status:', response.status);
         const analysis = await response.json();
+        console.log('Analysis response:', analysis);
+
+        if (!response.ok) {
+            throw new Error(analysis.detail || `API error: ${response.status}`);
+        }
 
         // Display risk result
         displayRiskResult(analysis, request);
 
     } catch (error) {
+        console.error('Analysis error:', error);
         alert(`Error analyzing payment: ${error.message}`);
     } finally {
         submitBtn.disabled = false;
@@ -173,22 +177,30 @@ async function cancelPayment(encodedRequest) {
  */
 async function confirmPayment(request, confirmed) {
     try {
+        const confirmPayload = {
+            request: request,
+            confirmed: confirmed,
+        };
+
+        console.log('Sending confirmation:', confirmPayload);
+
         const response = await fetch(`${API_BASE}/confirm`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                request: request,
-                confirmed: confirmed,
-            }),
+            body: JSON.stringify(confirmPayload),
         });
 
+        console.log('Confirmation response status:', response.status);
+        const data = await response.json();
+        console.log('Confirmation response data:', data);
+
         if (!response.ok) {
-            const error = await response.json();
-            alert(`Payment ${confirmed ? 'rejected' : 'cancelled'}: ${error.detail || 'Unknown error'}`);
+            const errorMsg = data.detail || data.message || 'Unknown error';
+            if (confirmed) {
+                alert(`Payment rejected: ${errorMsg}`);
+            }
             return;
         }
-
-        const result = await response.json();
 
         // Show confirmation message
         const resultDiv = document.getElementById('risk-display');
@@ -212,6 +224,7 @@ async function confirmPayment(request, confirmed) {
         loadAuditHistory();
 
     } catch (error) {
+        console.error('Confirmation error:', error);
         alert(`Error processing confirmation: ${error.message}`);
     }
 }

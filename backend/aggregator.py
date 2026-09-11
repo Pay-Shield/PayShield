@@ -44,8 +44,8 @@ def aggregate_and_decide(
 
     return {
         "final_score": final_score,
-        "category": category,
-        "action": action,
+        "category": category.value,  # Convert enum to string
+        "action": action.value,      # Convert enum to string
         "score_breakdown": {
             "recipient": recipient_score,
             "rule_based": rule_score,
