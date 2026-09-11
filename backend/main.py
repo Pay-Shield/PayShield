@@ -34,11 +34,19 @@ async def analyze_payment(request: PaymentRequest):
     )
 
     # Get LLM reasoning (can also run in parallel)
+    # Pre-calculate tentative score for LLM to decide if Claude explanation is needed
+    tentative_score = (
+        recipient_result.get("score_contribution", 0) +
+        rule_result["score"] +
+        behavioral_result["score"]
+    )
+
     llm_result = await asyncio.to_thread(
         get_llm_reasoning,
         request,
         recipient_result.get("status", "unknown"),
-        rule_result["score"] + recipient_result.get("score_contribution", 0),
+        rule_result["score"],
+        tentative_score,
     )
 
     # Aggregate all scores
