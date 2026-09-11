@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import requests
 from anthropic import Anthropic
 from models import PaymentRequest
 
@@ -11,11 +12,94 @@ def classify_fraud_intent(
     rule_score: float,
 ) -> dict:
     """
-    Use Nemotron (lightweight) for fast fraud classification and intent extraction.
+    Use Nemotron 3.5 Lightning for fast fraud classification and intent extraction.
     Returns score adjustment and detected risk factors.
+    Falls back to heuristics if API unavailable.
     """
-    # For now, use heuristic rules as Nemotron placeholder
-    # In production, this would call Nemotron via API
+    nemotron_key = os.getenv("NEMOTRON_API_KEY")
+
+    if nemotron_key:
+        result = _call_nemotron(request, recipient_status, rule_score)
+        if result:
+            return result
+
+    # Fallback to heuristic rules
+    return _classify_by_heuristics(request)
+
+
+def _call_nemotron(
+    request: PaymentRequest,
+    recipient_status: str,
+    rule_score: float,
+) -> dict:
+    """
+    Call Nemotron 3.5 Lightning API for fraud intent classification.
+    """
+    api_key = os.getenv("NEMOTRON_API_KEY")
+    api_endpoint = os.getenv(
+        "NEMOTRON_API_ENDPOINT",
+        "https://api.nemo.nvidia.com/v1/chat/completions"
+    )
+
+    prompt = f"""Analyze this payment request for fraud intent, social engineering, and impersonation.
+Be concise and return ONLY valid JSON.
+
+Payment:
+- To: {request.recipient_name} ({request.recipient_id})
+- Amount: ${request.amount}
+- Status: {recipient_status}
+- Note: "{request.note}"
+
+Return JSON:
+{{
+    "score_adjustment": <integer -15 to 15>,
+    "red_flags": [<list of strings: urgency_pressure, impersonation_attempt, irreversible_payout, or none>]
+}}"""
+
+    try:
+        response = requests.post(
+            api_endpoint,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "nemotron-3.5-lightning-30b-a3b",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 200,
+            },
+            timeout=10,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+            # Parse JSON from response
+            json_match = re.search(r"\{[^}]+\}", content)
+            if json_match:
+                result = json.loads(json_match.group())
+                score_adjustment = max(-15, min(15, result.get("score_adjustment", 0)))
+                red_flags = result.get("red_flags", [])
+
+                return {
+                    "score_contribution": score_adjustment,
+                    "red_flags": red_flags,
+                    "model": "nemotron-3.5-lightning-30b-a3b",
+                }
+
+        return None
+
+    except Exception as e:
+        print(f"Nemotron API error: {str(e)}")
+        return None
+
+
+def _classify_by_heuristics(request: PaymentRequest) -> dict:
+    """
+    Fallback heuristic fraud classification when API unavailable.
+    """
     score_adjustment = 0
     red_flags = []
 
@@ -40,7 +124,7 @@ def classify_fraud_intent(
     return {
         "score_contribution": score_adjustment,
         "red_flags": red_flags,
-        "model": "nemotron_heuristic",
+        "model": "heuristic_fallback",
     }
 
 

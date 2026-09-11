@@ -13,6 +13,11 @@ Intelligent payment security assistant that analyzes payment requests through mu
 
 **Key Principle:** Rules + LLM support the decision; deterministic rules engine is the final authority. No LLM-only decisions.
 
+**Model Stack:**
+- **Fraud Classification:** Nemotron 3.5 Lightning (fast, lightweight)
+- **Explanations:** Claude Sonnet 5 (high-quality, reserved for Medium/High risk)
+- **Fallback:** Heuristic rules if APIs unavailable
+
 **Categories:**
 - **Low (<30)** → Auto-approve
 - **Medium (30–59)** → Require confirmation
@@ -29,8 +34,19 @@ pip install -r requirements.txt
 ### 2. Configure environment
 ```bash
 cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
 ```
+
+Edit `.env` with your API keys:
+```
+ANTHROPIC_API_KEY=sk-...  # Claude API key (for explanations)
+NEMOTRON_API_KEY=...       # Nemotron API key (for fraud classification)
+NEMOTRON_API_ENDPOINT=...  # Optional, defaults to NVIDIA API Catalog
+```
+
+**Note:** 
+- If `NEMOTRON_API_KEY` is missing, fraud classification falls back to heuristics
+- If `ANTHROPIC_API_KEY` is missing, explanations use default templates
+- Both are optional but recommended for full functionality
 
 ### 3. Run the server
 ```bash
